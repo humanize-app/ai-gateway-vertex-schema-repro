@@ -6,14 +6,14 @@ Minimal reproduction for a Vercel support ticket (ENG-2120). Requests for
 shaped like a tool-use envelope. Everything comes back with `finishReason: stop` and no error from
 the Gateway.
 
-A plain forced tool call shows it most clearly. The tool is named `report`, and `toolCalls[0].input`
-should be the report object. Instead:
+A plain forced tool call shows it most clearly. In this example, the tool is named `report`, and `toolCalls[0].input`
+should be the report object starting with an `overview` field. Instead:
 
 ```json
 { "report": { "overview": { "goals": "...", "participants": "..." }, "findings": [ ... ] } }
 ```
 
-The inner object matches the tool's input schema exactly. It is the envelope that is wrong.
+The inner object matches the tool's input schema exactly. It's the envelope that is wrong.
 
 The envelope's shape varies between runs. Observed forms:
 
@@ -63,27 +63,6 @@ Generation ids, if these are easier to pull from your side:
 
 The production failure that opened the ticket is `gen_01M2HDTPMPTDE3R6G91Y4WC6TJ`, also with
 `finishReason: stop`.
-
-## It is not the API we chose
-
-Every structured-output API the AI SDK offers fails on this provider, and so does a plain forced
-tool call that uses no structured-output machinery at all. Three rounds each, same schema, same
-prompt, `npm run usage-check`:
-
-| call style | round 1 | round 2 | round 3 |
-| --- | --- | --- | --- |
-| `streamText` + `Output.object` | wrapped | mismatch | wrapped |
-| `generateObject` | enveloped | enveloped | enveloped |
-| `streamObject` | wrapped | wrapped | wrapped |
-| `generateText` + forced tool call | enveloped | enveloped | enveloped |
-| `Output.object`, thinking disabled | valid | wrapped | wrapped |
-
-The forced tool call is the important row. It defines a tool with an input schema and sets
-`toolChoice: { type: "tool", toolName: "report" }`, which is ordinary Anthropic tool use with no
-response format involved. It still comes back enveloped.
-
-Disabling extended thinking does not fix it either, though the `anthropic` path is the only one that
-emits `reasoning-*` stream parts at all.
 
 ## Symptom: the payload arrives as a string
 
