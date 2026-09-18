@@ -1,17 +1,34 @@
-# AI Gateway: the requested JSON schema does not constrain output on `vertexAnthropic`
+# AI Gateway: tool-call input comes back inside an extra envelope on `vertexAnthropic`
 
-Minimal reproduction for a Vercel support ticket (ENG-2120). A JSON response format request for
-`anthropic/claude-opus-5` returns a correct object every time when it routes to the `anthropic`
-provider. Routed to `vertexAnthropic`, the schema does not appear to constrain generation at all.
+Minimal reproduction for a Vercel support ticket (ENG-2120). Requests for
+`anthropic/claude-opus-5` that route to the `anthropic` provider are correct every time. Routed to
+`vertexAnthropic`, the model's payload is correct but arrives one level too deep, inside something
+shaped like a tool-use envelope. Everything comes back with `finishReason: stop` and no error from
+the Gateway.
 
-Two symptoms, both arriving with `finishReason: stop` and no error from the Gateway:
+A plain forced tool call shows it most clearly. The tool is named `report`, and `toolCalls[0].input`
+should be the report object. Instead:
 
-1. The whole object arrives JSON-encoded as a string, inside a single-property wrapper the schema
-   never mentions.
-2. A required property is missing from an otherwise well formed object.
+```json
+{ "report": { "overview": { "goals": "...", "participants": "..." }, "findings": [ ... ] } }
+```
 
-The second one is the more dangerous. The wrapper fails loudly at validation. A dropped property
-passes any caller that does not validate strictly, so the request quietly returns a partial result.
+The inner object matches the tool's input schema exactly. It is the envelope that is wrong.
+
+The envelope's shape varies between runs. Observed forms:
+
+| form | example |
+| --- | --- |
+| keyed by the tool name | `{"report": {…the payload…}}` |
+| an Anthropic tool-use block | `{"tool_use_id": "tool_1", "input": {…the payload…}}` |
+| an arbitrary key, payload stringified | `{"value": "{\"overview\": …}"}` |
+| an arbitrary key, payload nested | `{"paramCorrupted": {…the payload…}}` |
+
+The `{"input": "…"}` form in our original report is the same bug: `input` is the payload field of an
+Anthropic tool-use block.
+
+This is not limited to structured output. Because it reaches plain tool calling, any tool call with
+a non-trivial input schema on this path is exposed.
 
 ## Reproduce
 
@@ -47,7 +64,28 @@ Generation ids, if these are easier to pull from your side:
 The production failure that opened the ticket is `gen_01M2HDTPMPTDE3R6G91Y4WC6TJ`, also with
 `finishReason: stop`.
 
-## Symptom 1: the object arrives as a string
+## It is not the API we chose
+
+Every structured-output API the AI SDK offers fails on this provider, and so does a plain forced
+tool call that uses no structured-output machinery at all. Three rounds each, same schema, same
+prompt, `npm run usage-check`:
+
+| call style | round 1 | round 2 | round 3 |
+| --- | --- | --- | --- |
+| `streamText` + `Output.object` | wrapped | mismatch | wrapped |
+| `generateObject` | enveloped | enveloped | enveloped |
+| `streamObject` | wrapped | wrapped | wrapped |
+| `generateText` + forced tool call | enveloped | enveloped | enveloped |
+| `Output.object`, thinking disabled | valid | wrapped | wrapped |
+
+The forced tool call is the important row. It defines a tool with an input schema and sets
+`toolChoice: { type: "tool", toolName: "report" }`, which is ordinary Anthropic tool use with no
+response format involved. It still comes back enveloped.
+
+Disabling extended thinking does not fix it either, though the `anthropic` path is the only one that
+emits `reasoning-*` stream parts at all.
+
+## Symptom: the payload arrives as a string
 
 Expected, and what `anthropic` returns:
 
@@ -78,7 +116,7 @@ Collected so far:
 
 Most of those are tool-protocol vocabulary that appears in neither our prompt nor our schema.
 
-## Symptom 2: a required property is dropped
+## Symptom: a required property is dropped
 
 `findings` is required with `minItems: 1`, and is simply absent:
 
@@ -127,11 +165,12 @@ data: {"type":"text-delta","id":"0","delta":"view\\\": {\\\"goals\\\": \\\""}
 
 The client reassembles exactly what arrived. Full logs for both providers land in `raw/` after a run.
 
-## Which schemas trigger it
+## Which schemas trigger it (response-format path)
 
 Six variants, five rounds each, round-robin so provider-side variation over time hits every variant
 equally. Only the marked field differs between the `-deep` variants. Run it with `npm run bisect`,
-which takes `CASES`, `ROUNDS`, and `PROVIDER`.
+which takes `CASES`, `ROUNDS`, and `PROVIDER`. These cover the response-format path only. The
+envelope reaches plain tool calls regardless of schema shape.
 
 | variant | what it changes | result over 5 runs |
 | --- | --- | --- |
@@ -146,15 +185,19 @@ Nesting is what separates the passing case from the failing ones, not any single
 `plain-deep` has no null and no `anyOf` and still fails, and `union-deep` fails on every run with an
 `anyOf` that has no null branch. The flat object is the only variant that was correct every time.
 
-## Why we read this as the schema not binding
+## How we read this
 
-A schema that constrained the output could not produce a wrapper property it never mentions, and
-could not omit a property it marks required. The wrapper names read like tool-call scaffolding, and
-this path emits no `reasoning-*` stream parts while the `anthropic` path does. That points at the
-JSON response format being satisfied by instruction rather than by a schema-bearing tool call.
+The payload is right and the envelope around it is wrong, across every call style including plain
+tool use. That points at the tool-call input being wrapped a second time somewhere on this path
+rather than handed back as-is.
 
-We cannot see the upstream Vertex request, so that last part is inference from the response side
-rather than a claim about your adapter.
+What we cannot explain from outside is why the envelope's shape changes run to run. A fixed adapter
+bug would presumably produce one consistent shape, so the model may be producing the envelope itself
+in response to something it is being shown. Either way it is server-side: the Gateway's own response
+stream carries the envelope from its first delta, and the client only reassembles what arrived.
+
+We cannot see the upstream Vertex request, so this is inference from the response side rather than a
+claim about your adapter.
 
 ## Versions
 
@@ -170,4 +213,6 @@ as a different failure. The generation ids above should let you pull these from 
 ## Our workaround
 
 Pinning the affected requests to `providerOptions: { gateway: { only: ["anthropic"] } }`, which
-costs us the fallback pool and the capacity that comes with it.
+costs us the fallback pool and the capacity that comes with it. Since this reaches plain tool
+calling too, the pin has to cover every Claude request that uses a tool or a response format, not
+just the one that surfaced the problem.

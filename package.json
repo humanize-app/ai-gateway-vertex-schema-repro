@@ -5,6 +5,7 @@
     "scripts": {
         "repro": "tsx repro.ts",
         "bisect": "tsx bisect.ts",
+        "usage-check": "tsx usage-check.ts",
         "typecheck": "tsc --noEmit"
     },
     "dependencies": {
